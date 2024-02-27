@@ -1,33 +1,12 @@
-import sys
-import io
-import subprocess
 import argparse
-import tempfile
+import re
 
-import ghostscript
+import fitz
 
-def run_cpdf(args):
-    process = subprocess.run([
-        "cpdf",
-        *args
-    ], 
-    capture_output=True)
+# Total number of pages in the book
+total_page_count = 322
 
-    if process.returncode != 0:
-        print("CPDF call failed! Error below:", file=sys.stderr)
-        print(process.stderr.decode(), file=sys.stderr)
-        sys.exit(1)
-
-def split_cpdf(in_file, temp_folder):
-   run_cpdf(["-split", in_file, "-o", f"{temp_folder}/page-%%%.pdf"])
-
-def merge_cpdf(in_files, temp_folder):
-    run_cpdf(["-merge", *in_files, "-o", f"{temp_folder}/temp.pdf"])
-
-def copy_annotations_cpdf(original_file, out_file, temp_folder):
-    run_cpdf(["-copy-annotations", original_file,  f"{temp_folder}/temp.pdf", "-o", out_file])
-
-total_page_count = 323
+# Page numbers with dark backgrounds
 inverted_pages = [
     1, 2, 3,             # Header
     8, 9,                # Connectors: title page
@@ -41,6 +20,58 @@ inverted_pages = [
     320, 321, 322        # Footer
 ]
 
+# Page numbers with light backgrounds (i.e., everything else)
+keep_pages = [i for i in range(1, total_page_count + 1) if i not in inverted_pages]
+
+"""
+Regex to match four floating point numbers, i.e. "0 0 0 0", "0.1 0.2 0.3 0.4", or ".1 .2 .3 .4"
+Explanation: 
+( # <- Capturing group, single number
+    (?: # <- Non-capturing group, matches non-fractional part
+        [0-9]*[.] # <- Any number of digits followed by a dot
+    )? # <- Zero or one of this group
+    [0-9]+ # <- One or more digits
+)
+"""
+cmyk_args_regex = b"((?:[0-9]*[.])?[0-9]+) ((?:[0-9]*[.])?[0-9]+) ((?:[0-9]*[.])?[0-9]+) ((?:[0-9]*[.])?[0-9]+)"
+
+# Matches "[num] [num] [num] [num] k"
+fill_regex = re.compile(cmyk_args_regex + b" (k)")
+
+# Matches "[num] [num] [num] [num] K"
+stroke_regex = re.compile(cmyk_args_regex + b" (K)")
+
+# Passed into re.sub to invert the K channel of stroke and fill color operations
+def invert_sub(match: re.Match):
+    c, m, y, k, op = match.groups()
+
+    if op == b"k" and k == b".98":
+        # Dark fill should translate to pure white, not gray
+        return b"%b %b %b %b %b" % (c, m, y, b"0", op)
+    elif op == b"k" and k == b"0":
+        # Pure white fill should translate to dark color, not pure black
+        return b"%b %b %b %b %b" % (c, m, y, b".98", op)
+    else:
+        # Otherwhise, everything else should be naively inverted.
+        k = 1 - float(k)
+        k = str(k).encode('ascii')
+        return b"%b %b %b %b %b" % (c, m, y, k, op)
+    
+# These are unused because invert_sub programatically inverts now, but this is what it should _ideally_ produce for the book.
+color_map = {
+    # Fills
+    b"0 0 0 1 k": b"0 0 0 0 k", # Full black to full white
+    b"0 0 0 .98 k":
+    b"0 0 0 0 k", # Dark to full white
+    b"0 0 0 0 k": b"0 0 0 .98 k", # Full white to dark
+    b"0 0 0 .8 k": b"0 0 0 .2 k", # Dark gray to light gray
+    b"0 0 0 .2 K": b"0 0 0 .8 K", # Light gray to dark gray
+
+    # Strokes
+    b"0 0 0 0 K": b"0 0 0 1 K", # Full white to full black
+    b"0 0 0 1 K": b"0 0 0 0 K", # Full black to full white
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="Pinouts Book Cleaner", 
@@ -49,48 +80,25 @@ if __name__ == "__main__":
 
     parser.add_argument("input", help="Path to the original PDF. You can download the latest version at https://pinouts.org")
     parser.add_argument("output", help="Path to the output PDF.")
+    parser.add_argument("-d", "--dark", help='Enable "dark mode." Replaces white backgrounds with dark backgrounds.', action='store_true')
 
     args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory() as temp_folder:
-        print("Splitting pages...")
-        split_cpdf(args.input, temp_folder)
+    doc = fitz.open(args.input)
 
-        keep_pages = [i for i in range(1, total_page_count) if i not in inverted_pages]
+    page_nums = keep_pages if args.dark else inverted_pages
 
-        for i in inverted_pages:
-            # These values best create a fully white background.
-            # 1.2 - C, 1.2 - M, 1.2 - Y, 1 * K
-            injected_postscript = "{1.2 exch sub}{1.2 exch sub}{1.2 exch sub}{1 mul} setcolortransfer"
+    for page_num in page_nums:
+        page = doc[page_num - 1]
 
-            gs_args = [
-                "printable-pinout",
-                "-o", f"{temp_folder}/inverted-{i:03d}.pdf",
-                "-sDEVICE=pdfwrite",
-                "-c", injected_postscript, 
-                "-f", f"{temp_folder}/page-{i:03d}.pdf"
-            ]
+        # Unifying the contents of the page doesn't leave it exactly as it was before, but it's a lot simpler to deal with, and hopefully there's no visual effects.
+        page.clean_contents()
+        xref = page.get_contents()[0]
 
-            stdout = io.BytesIO()
-            stderr = io.BytesIO()
+        old_stream = doc.xref_stream(xref)
 
-            print(f"Inverting page {i}/{total_page_count}...")
-            ghostscript.Ghostscript(*gs_args, stdin=None, stdout=stdout, stderr=stderr)
+        new_stream = fill_regex.sub(invert_sub, old_stream)
+        new_stream = stroke_regex.sub(invert_sub, new_stream)
 
-        out_pages = [(i, False) for i in keep_pages] + [(i, True) for i in inverted_pages]
-        out_pages.sort(key=lambda x: x[0])
-
-        concat_paths = []
-        for i, inverted in out_pages:
-            if inverted:
-                concat_paths.append(f"{temp_folder}/inverted-{i:03d}.pdf")
-            else:
-                concat_paths.append(f"{temp_folder}/page-{i:03d}.pdf")
-
-        print("Merging pages...")
-        merge_cpdf(concat_paths, temp_folder)
-
-        print("Copying ToC links...")
-        copy_annotations_cpdf(args.input, args.output, temp_folder)
-
-        print("Done!")
+        doc.update_stream(xref, new_stream)
+    doc.save(args.output)
