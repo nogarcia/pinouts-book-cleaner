@@ -18,4 +18,4 @@ $ python clean.py --dark path/to/original-pinouts.pdf path/to/dark.pdf
 
 ## License
 
-This repository is licensed under the [MIT License](./LICENSE.md), but both the Pinouts Book and the resultance file from this script are licensed [CC-BY-SA](https://creativecommons.org/licenses/by-sa/4.0/) (no version specified, defer to original authors.)
+This repository is licensed under the [MIT License](./LICENSE.md), but both the Pinouts Book and the resultant file from this script are licensed [CC-BY-SA](https://creativecommons.org/licenses/by-sa/4.0/) (no version specified, defer to original authors.)
